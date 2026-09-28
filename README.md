@@ -15,6 +15,10 @@
 有序回退步骤（删新建文件、恢复被覆盖文件、由深到浅删除新建目录）；
 以及**目录镜像同步预演**接口：给定现存布局与期望归档布局，只在内存中生成
 把现存布局同步为期望布局的完整操作序列（删除多余/类型互换节点、建目录、写文件）；
+另有**磁盘暂存峰值预演**接口：给定目标目录现存清单（文件带大小）、按顺序解包的
+清单与初始可用字节数，在沿用覆盖预演判定的同时模拟“同盘备份一次 → 暂存新文件 →
+替换并释放旧占用”的磁盘占用曲线，逐条给出暂存峰值与提交后新增占用、整批峰值以及
+首次超过初始可用字节数的阶段与条目下标，即使超额也把整批预演完成；
 另有**清单核对**接口：给定约定清单与交付清单（条目含相对路径、`file`/`directory`
 类型与文件声明的 SHA-256），按 Windows 比较键核对缺失、额外、类型不符、摘要不符
 与一致，单侧同键重复整键列为歧义，一侧文件占据另一侧条目祖先路径时归为层级阻挡；
@@ -270,6 +274,98 @@ curl -s http://localhost:8000/api/v1/rollback-preview \
 
 上例返回的回退步骤：先删除新建的 `new.txt`，再从备份恢复
 `docs/readme.txt`（无新建目录，故无 `REMOVE_DIRECTORY`）。
+
+### `POST /api/v1/disk-peak-preview`
+
+磁盘暂存峰值预演：给定目标目录**现存清单**（`existing`，文件带大小）、**按顺序
+解包的清单**（`incoming`）与**初始可用字节数**（`initial_available_bytes`），
+在**完全沿用 overlay-preview 判定**（Windows 路径规范化与同键比较、现存清单
+校验、CREATE / OVERWRITE / REUSE_DIRECTORY / BLOCKED 逐条阻挡/覆盖判定、成功
+条目立即入树）的同时，于内存中模拟真实解包器在**同一磁盘**上的占用曲线。全程
+纯内存计算，不访问文件系统。
+
+**空间语义**（所有字节数均为相对**解包前磁盘占用**的增量）：
+
+- **只有成功写入的文件计空间**：`CREATE` 与 `OVERWRITE` 占空间；
+  `REUSE_DIRECTORY`、`CREATE` 目录等所有目录，以及各类 `BLOCKED` 条目
+  （不安全路径、文件祖先阻挡、类型冲突）**完全不占空间**。
+- **首次覆盖现存文件前**：在同一磁盘备份原始大小**一次**（占用 +旧文件大小）。
+  同键（大小写/NFC/段尾变体均算同键）只备份一次，后续重复覆盖不再备份；
+  备份在本模型中**一直保留到预演结束**（占用不释放）。**前缀中新建后又被覆盖
+  的文件不属于现存文件，不备份**。
+- **每次写入先暂存后替换**：先暂存新文件的完整大小（占用 +新大小），该暂存点
+  即该条目的占用峰值；暂存完成后替换原文件并**释放旧文件占用**（占用 −旧大小，
+  新建时旧大小为 0）。故覆盖提交后的净增量 = 备份 +新大小 −旧大小，文件缩小时
+  净增量可以为 0（甚至因新文件为 0 字节而不额外占空间）。
+- **初始可用字节数**：解包开始时同一磁盘上的可用空间（非负整数）。占用增量
+  **严格大于**该值才算超出（**等于额度不算超出**）。首次超额可能发生在
+  `BACKUP`（备份原始大小）或 `STAGING`（暂存新文件）阶段；同一文件先备份超额
+  时阶段记为 `BACKUP`。**即使超额，预演也照常模拟完全部条目**，仅记录首次超额
+  的阶段与条目下标。
+
+请求体：
+
+```json
+{
+  "existing": [
+    { "path": "docs/readme.txt", "type": "file", "size_bytes": 100 },
+    { "path": "assets", "type": "directory" },
+    { "path": "big.bin", "type": "file", "size_bytes": 1000 },
+    { "path": "blocked", "type": "file", "size_bytes": 7 }
+  ],
+  "incoming": [
+    { "path": "docs/readme.txt", "type": "file", "size_bytes": 300 },
+    { "path": "new/a.bin", "type": "file", "size_bytes": 50 },
+    { "path": "assets", "type": "directory" },
+    { "path": "big.bin", "type": "file", "size_bytes": 2000 },
+    { "path": "blocked/x", "type": "file", "size_bytes": 9 }
+  ],
+  "initial_available_bytes": 1000
+}
+```
+
+- `existing` / `incoming` 条目为相对路径 + `file` / `directory`；**文件必须
+  声明非负的 `size_bytes`（字节），`directory` 不得携带**（否则返回 422）。
+  `existing` 沿用 overlay-preview 的现存清单校验：不安全路径、同键
+  （Windows 比较键）重复、文件占据其他条目祖先路径均返回 422；`incoming`
+  至少 1 条，其中的不安全条目不返回 422，而在干跑中记为 `BLOCKED`
+  （但其 `size_bytes` 仍须随类型合法提供）。
+- `initial_available_bytes` 为非负整数；负数或缺失返回 422。
+
+上例的占用推进（初始增量 0，额度 1000）：
+
+| incoming | 结果 | BACKUP | STAGING（条目峰值） | 提交后净新增 |
+| --- | --- | --- | --- | --- |
+| #1 `docs/readme.txt` 300 | OVERWRITE | +100 → 100 | +300 → **400** | −100 → 300 |
+| #2 `new/a.bin` 50 | CREATE | — | +50 → **350** | 350 |
+| #3 `assets` | REUSE_DIRECTORY | 不占空间 | 不占空间 | `null` |
+| #4 `big.bin` 2000 | OVERWRITE | +1000 → **1350**（首次超额：`BACKUP`） | +2000 → **3350** | −1000 → 2350 |
+| #5 `blocked/x` | BLOCKED（文件祖先） | 不占空间 | 不占空间 | `null` |
+
+响应字段（`entries` 严格保持 `incoming` 输入顺序，`index` 从 1 开始；
+路径判定字段与 overlay-preview 完全一致，另加两个空间字段）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `entries[].status` / `blocked_reason` / `blocked_by` 等 | 与 overlay-preview 的 entries 完全一致 |
+| `entries[].staging_peak_bytes` | 该条目**暂存新文件时**整批占用相对解包前的累计峰值（字节）；仅成功写入的文件（CREATE/OVERWRITE）有值，目录与被阻挡条目为 `null` |
+| `entries[].committed_bytes` | 该条目**替换提交后**整批相对解包前的累计净新增占用（字节，= 全部已备份旧文件 + 当前各文件大小 − 已被替换的原大小）；仅成功写入的文件有值，目录与被阻挡条目为 `null` |
+| `initial_available_bytes` | 回显请求的初始可用字节数 |
+| `summary.batch_peak_bytes` | **整批峰值**：解包全程整批占用相对解包前的最大增量（含同盘备份与暂存占用），取所有备份点与暂存点的最大值 |
+| `summary.committed_bytes` | 全部条目提交后的累计净新增占用（字节） |
+| `summary.first_exceed` | **首次超过初始可用字节数**的定位：`phase` 为 `BACKUP` 或 `STAGING`，`index` 为该 incoming 条目下标（从 1 开始），`canonical_path` 为其规范路径；全程未超出（含恰好等于额度）时为 `null`。超额不中断预演，其余字段照常给出 |
+| `summary` 其余字段 | `total / create / overwrite / reuse_directory / blocked` 各状态计数（目录与文件分别计数） |
+
+curl 示例（服务监听宿主机 **8000** 端口）：
+
+```bash
+curl -s http://localhost:8000/api/v1/disk-peak-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"existing":[{"path":"f.bin","type":"file","size_bytes":100}],"incoming":[{"path":"f.bin","type":"file","size_bytes":300},{"path":"g.bin","type":"file","size_bytes":50}],"initial_available_bytes":1000}'
+```
+
+上例：覆盖 `f.bin` 时备份 100、暂存 300（峰值 400）、释放旧 100 后提交 300；
+新建 `g.bin` 暂存 50 后提交 350；整批峰值 400，未超额度，`first_exceed` 为 `null`。
 
 ### `POST /api/v1/mirror-preview`
 
@@ -812,15 +908,16 @@ curl -s http://localhost:8000/api/v1/preflight \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/rollback-preview、/api/v1/mirror-preview、/api/v1/manifest-audit、/api/v1/relocation-preview）
+│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/disk-peak-preview、/api/v1/rollback-preview、/api/v1/mirror-preview、/api/v1/manifest-audit、/api/v1/relocation-preview）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、rollback-preview、mirror-preview、manifest-audit、relocation-preview）
-│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、前缀回退预演、镜像同步预演、清单核对与重定位预演编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、disk-peak-preview、rollback-preview、mirror-preview、manifest-audit、relocation-preview）
+│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、磁盘暂存峰值预演、前缀回退预演、镜像同步预演、清单核对与重定位预演编排
 │   ├── audit.py         # 清单核对：缺失/额外/类型不符/摘要不符/一致、层级阻挡与同键歧义（纯函数）
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   ├── resource.py      # 解压资源预算校验：单文件/整批解压大小、整数交叉乘法压缩比（纯函数）
 │   ├── selection.py     # selection_rules glob 匹配（*、? 按段，** 跨多级）与 include/exclude 筛选（纯函数）
 │   ├── overlay.py       # 目标目录覆盖预演：清单校验、虚拟目录树与按序干跑（纯函数）
+│   ├── disk_peak.py     # 磁盘暂存峰值预演：同盘备份一次→暂存新文件→替换释放旧占用的占用曲线（纯函数）
 │   ├── rollback.py      # 前缀解包回退预演：执行前备份清单与删文件/恢复/深→浅删目录三阶段回退步骤（纯函数）
 │   ├── mirror.py        # 目录镜像同步预演：三阶段操作序列（删除→建目录→写文件，纯函数）
 │   ├── relocation.py    # 路径重定位预演：源前缀→目标前缀改写与结果冲突检测（纯函数）

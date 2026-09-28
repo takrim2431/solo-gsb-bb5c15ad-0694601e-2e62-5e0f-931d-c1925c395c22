@@ -8,6 +8,8 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from .schemas import (
+    DiskPeakPreviewRequest,
+    DiskPeakPreviewResponse,
     HealthResponse,
     ManifestAuditRequest,
     ManifestAuditResponse,
@@ -23,6 +25,7 @@ from .schemas import (
     RollbackPreviewResponse,
 )
 from .service import (
+    run_disk_peak_preview,
     run_manifest_audit,
     run_mirror_preview,
     run_overlay_preview,
@@ -48,10 +51,13 @@ app = FastAPI(
         "并预检结果中的同键重复与文件祖先冲突）；前缀解包回退预演"
         "（仅模拟按序解包清单的前 stop_after 条，给出执行前需备份的现存文件与"
         "可还原该前缀变化的有序回退步骤：删新建文件、恢复被覆盖文件、由深到浅"
-        "删除新建目录）。"
+        "删除新建目录）；磁盘暂存峰值预演（给定现存清单、按序解包清单与初始"
+        "可用字节数，模拟同盘备份一次、先暂存新文件再替换释放旧占用的空间曲线，"
+        "逐条给出暂存峰值与提交后新增占用、整批峰值及首次超额阶段与条目，"
+        "超额也继续预演）。"
         "纯内存计算，不访问文件系统。"
     ),
-    version="1.8.0",
+    version="1.9.0",
 )
 
 
@@ -72,6 +78,7 @@ def root() -> dict[str, str]:
         "manifest_audit": "POST /api/v1/manifest-audit",
         "relocation_preview": "POST /api/v1/relocation-preview",
         "rollback_preview": "POST /api/v1/rollback-preview",
+        "disk_peak_preview": "POST /api/v1/disk-peak-preview",
     }
 
 
@@ -94,6 +101,19 @@ def preflight(request: PreflightRequest):
 )
 def overlay_preview(request: OverlayPreviewRequest) -> OverlayPreviewResponse:
     return run_overlay_preview(request)
+
+
+@app.post(
+    "/api/v1/disk-peak-preview",
+    response_model=DiskPeakPreviewResponse,
+    tags=["overlay"],
+    summary=(
+        "磁盘暂存峰值预演：按现存清单、按序解包清单与初始可用字节数模拟"
+        "同盘备份/暂存/替换的占用曲线（纯内存，超额也继续预演）"
+    ),
+)
+def disk_peak_preview(request: DiskPeakPreviewRequest) -> DiskPeakPreviewResponse:
+    return run_disk_peak_preview(request)
 
 
 @app.post(

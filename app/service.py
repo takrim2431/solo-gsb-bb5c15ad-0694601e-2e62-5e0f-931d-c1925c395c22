@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .normalize import Issue, IssueCode, IssueSeverity, NormalizedEntry, normalize_entry
 from .audit import AuditEntry, audit_manifests
+from .disk_peak import simulate_disk_peak
 from .mirror import MirrorOperation, plan_mirror
 from .relocation import (
     RelocationConflictType,
@@ -12,6 +13,7 @@ from .relocation import (
     relocate_entries,
 )
 from .overlay import (
+    FILE_TYPE,
     OverlayNodeSource,
     OverlayStatus,
     apply_entry,
@@ -24,6 +26,11 @@ from .rollback import RollbackOperation, plan_prefix_rollback
 from .schemas import (
     CollisionGroup,
     CollisionMember,
+    DiskPeakEntryOut,
+    DiskPeakFirstExceedOut,
+    DiskPeakPreviewRequest,
+    DiskPeakPreviewResponse,
+    DiskPeakSummary,
     EntryType,
     HierarchyConflict,
     ManifestAmbiguousKeyOut,
@@ -407,6 +414,81 @@ def run_overlay_preview(request: OverlayPreviewRequest) -> OverlayPreviewRespons
     )
     return OverlayPreviewResponse(
         target="windows", entries=entries_out, summary=summary
+    )
+
+
+def run_disk_peak_preview(request: DiskPeakPreviewRequest) -> DiskPeakPreviewResponse:
+    """磁盘暂存峰值预演：现存清单建树后按序模拟“同盘备份 → 暂存 → 替换”（纯内存）。
+
+    现存清单已在请求模型校验阶段通过
+    :func:`app.overlay.validate_existing_entries` 检查，文件 size_bytes 的
+    非负与按类型携带也已在 schema 层保证（否则请求以 422 被拒绝）。
+    即使整批峰值超过初始可用字节数也照常模拟完全部条目，仅记录首次超额点。
+    """
+    existing = [
+        normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+        for i, e in enumerate(request.existing, start=1)
+    ]
+    tree = build_existing_tree(existing)
+    sizes = {
+        entry.comparison_key: request.existing[entry.index - 1].size_bytes
+        for entry in existing
+        if entry.entry_type == FILE_TYPE
+    }
+
+    incoming = [
+        (
+            normalize_entry(
+                index=i, entry_type=entry_in.type.value, original_path=entry_in.path
+            ),
+            entry_in.size_bytes,
+        )
+        for i, entry_in in enumerate(request.incoming, start=1)
+    ]
+    simulation = simulate_disk_peak(
+        tree,
+        sizes,
+        incoming,
+        initial_available_bytes=request.initial_available_bytes,
+    )
+
+    entries_out: list[DiskPeakEntryOut] = []
+    counts = {status: 0 for status in OverlayStatus}
+    for (normalized, _), result in zip(incoming, simulation.results):
+        counts[result.decision.status] += 1
+        base = _overlay_entry_out(normalized, result.decision).model_dump()
+        entries_out.append(
+            DiskPeakEntryOut(
+                **base,
+                staging_peak_bytes=result.staging_peak,
+                committed_bytes=result.committed,
+            )
+        )
+
+    first_exceed = simulation.first_exceed
+    summary = DiskPeakSummary(
+        total=len(entries_out),
+        create=counts[OverlayStatus.CREATE],
+        overwrite=counts[OverlayStatus.OVERWRITE],
+        reuse_directory=counts[OverlayStatus.REUSE_DIRECTORY],
+        blocked=counts[OverlayStatus.BLOCKED],
+        batch_peak_bytes=simulation.batch_peak,
+        committed_bytes=simulation.final_committed,
+        first_exceed=(
+            None
+            if first_exceed is None
+            else DiskPeakFirstExceedOut(
+                phase=first_exceed.phase,
+                index=first_exceed.index,
+                canonical_path=first_exceed.canonical_path,
+            )
+        ),
+    )
+    return DiskPeakPreviewResponse(
+        target="windows",
+        initial_available_bytes=request.initial_available_bytes,
+        entries=entries_out,
+        summary=summary,
     )
 
 

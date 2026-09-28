@@ -482,6 +482,119 @@ class OverlayPreviewResponse(BaseModel):
     summary: OverlaySummary
 
 
+class DiskPeakEntryIn(BaseModel):
+    path: str = Field(..., description="目标目录内的相对路径（原始形式）")
+    type: OverlayEntryType = Field(..., description="条目类型：file 或 directory")
+    size_bytes: int | None = Field(
+        default=None,
+        ge=0,
+        description="文件大小（字节，非负）；type 为 file 时必须提供，directory 不得携带",
+    )
+
+    @model_validator(mode="after")
+    def _validate_size_bytes(self) -> "DiskPeakEntryIn":
+        if self.type is OverlayEntryType.FILE:
+            if self.size_bytes is None:
+                raise ValueError("type 为 file 时必须提供非负的 size_bytes")
+        elif self.size_bytes is not None:
+            raise ValueError("仅 file 条目可携带 size_bytes")
+        return self
+
+
+class DiskPeakPreviewRequest(BaseModel):
+    """磁盘暂存峰值预演请求：现存清单 + 按序解包清单 + 初始可用字节数（纯内存干跑）。"""
+
+    existing: list[DiskPeakEntryIn] = Field(
+        default_factory=list,
+        description=(
+            "目标目录现存的 file/directory 清单（可为空，表示空目录）；"
+            "文件必须声明非负 size_bytes，目录不带大小；"
+            "含不安全路径、同键重复或文件占据其他条目祖先路径时返回 422"
+        ),
+    )
+    incoming: list[DiskPeakEntryIn] = Field(
+        ..., min_length=1, description="按顺序解包的 file/directory 清单（至少 1 条）"
+    )
+    initial_available_bytes: int = Field(
+        ..., ge=0, description="解包开始时同一磁盘上的初始可用字节数（非负）"
+    )
+
+    @model_validator(mode="after")
+    def _validate_existing_list(self) -> "DiskPeakPreviewRequest":
+        normalized = [
+            normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+            for i, e in enumerate(self.existing, start=1)
+        ]
+        validate_existing_entries(normalized)
+        return self
+
+
+class DiskPeakPhase(str, Enum):
+    BACKUP = "BACKUP"
+    STAGING = "STAGING"
+
+
+class DiskPeakEntryOut(OverlayEntryOut):
+    staging_peak_bytes: int | None = Field(
+        ...,
+        description=(
+            "该条目暂存新文件时整批占用相对解包前的累计峰值（字节）；"
+            "仅成功写入的文件（CREATE/OVERWRITE）有值，目录与被阻挡条目为 null"
+        ),
+    )
+    committed_bytes: int | None = Field(
+        ...,
+        description=(
+            "该条目替换提交后整批相对解包前的累计净新增占用（字节）；"
+            "仅成功写入的文件有值，目录与被阻挡条目为 null"
+        ),
+    )
+
+
+class DiskPeakFirstExceedOut(BaseModel):
+    phase: DiskPeakPhase = Field(
+        ...,
+        description=(
+            "首次超过初始可用字节数的阶段：BACKUP（首次覆盖现存文件前备份原始大小）"
+            "或 STAGING（暂存新文件完整大小）；等于额度不算超出"
+        ),
+    )
+    index: int = Field(..., description="首次超额时处理的 incoming 条目下标（从 1 开始）")
+    canonical_path: str = Field(..., description="该条目的规范路径（正斜杠分隔）")
+
+
+class DiskPeakSummary(BaseModel):
+    total: int
+    create: int
+    overwrite: int
+    reuse_directory: int
+    blocked: int
+    batch_peak_bytes: int = Field(
+        ...,
+        description=(
+            "整批暂存峰值（字节）：解包全程整批占用相对解包前的最大增量，"
+            "含同盘备份占用与暂存新文件占用"
+        ),
+    )
+    committed_bytes: int = Field(
+        ..., description="全部条目提交后相对解包前的累计净新增占用（字节）"
+    )
+    first_exceed: DiskPeakFirstExceedOut | None = Field(
+        ...,
+        description=(
+            "首次超过初始可用字节数的阶段与条目下标（备份或暂存）；"
+            "全程未超出（含恰好等于额度）时为 null；即使超额预演也继续完成"
+        ),
+    )
+
+
+class DiskPeakPreviewResponse(BaseModel):
+    target: str = "windows"
+    initial_available_bytes: int = Field(..., description="回显请求的初始可用字节数")
+    entries: list[DiskPeakEntryOut]
+    summary: DiskPeakSummary
+
+
 class RollbackPreviewRequest(BaseModel):
     """前缀解包回退预演请求：现存清单 + 按顺序解包清单 + 仅模拟前 stop_after 条。"""
 
