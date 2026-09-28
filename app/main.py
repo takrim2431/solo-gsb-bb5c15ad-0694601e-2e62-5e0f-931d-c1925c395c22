@@ -8,6 +8,8 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from .schemas import (
+    DiskPeakPreviewRequest,
+    DiskPeakPreviewResponse,
     HealthResponse,
     ManifestAuditRequest,
     ManifestAuditResponse,
@@ -23,6 +25,7 @@ from .schemas import (
     RollbackPreviewResponse,
 )
 from .service import (
+    run_disk_peak_preview,
     run_manifest_audit,
     run_mirror_preview,
     run_overlay_preview,
@@ -40,6 +43,9 @@ app = FastAPI(
         "（单文件解压大小、整批解压总量、最大压缩比）；可选的 selection_rules"
         " 在预检前按规范化路径 glob 筛选实际解包条目；目标目录覆盖预演"
         "（按现存清单与解包顺序干跑 CREATE/OVERWRITE/REUSE_DIRECTORY/BLOCKED）；"
+        "磁盘暂存峰值预演（沿用覆盖干跑判定，模拟首次覆盖前备份、先暂存新文件"
+        "完整大小再替换释放旧文件的磁盘占用，给出逐条暂存峰值与提交后净增、"
+        "整批峰值及首次超过初始可用字节数的阶段与条目下标）；"
         "目录镜像同步预演（把现存布局同步为期望归档布局，纯内存生成"
         " DELETE/KEEP_DIRECTORY/CREATE_DIRECTORY/OVERWRITE_FILE/CREATE_FILE 操作序列）；"
         "清单核对（约定清单 vs 交付清单：缺失、额外、类型不符、摘要不符、"
@@ -51,7 +57,7 @@ app = FastAPI(
         "删除新建目录）。"
         "纯内存计算，不访问文件系统。"
     ),
-    version="1.8.0",
+    version="1.9.0",
 )
 
 
@@ -68,6 +74,7 @@ def root() -> dict[str, str]:
         "health": "/health",
         "preflight": "POST /api/v1/preflight",
         "overlay_preview": "POST /api/v1/overlay-preview",
+        "disk_peak_preview": "POST /api/v1/disk-peak-preview",
         "mirror_preview": "POST /api/v1/mirror-preview",
         "manifest_audit": "POST /api/v1/manifest-audit",
         "relocation_preview": "POST /api/v1/relocation-preview",
@@ -94,6 +101,16 @@ def preflight(request: PreflightRequest):
 )
 def overlay_preview(request: OverlayPreviewRequest) -> OverlayPreviewResponse:
     return run_overlay_preview(request)
+
+
+@app.post(
+    "/api/v1/disk-peak-preview",
+    response_model=DiskPeakPreviewResponse,
+    tags=["overlay"],
+    summary="磁盘暂存峰值预演：按序模拟写盘占用、整批峰值与首次超额阶段（纯内存）",
+)
+def disk_peak_preview(request: DiskPeakPreviewRequest) -> DiskPeakPreviewResponse:
+    return run_disk_peak_preview(request)
 
 
 @app.post(

@@ -10,6 +10,11 @@
 预检前按规范化后的归档路径 glob **筛选实际解包条目**（include/exclude）；
 另有**目标目录覆盖预演**接口：给定目标目录现存清单与按顺序解包的清单，
 在内存中的虚拟目录树上逐条干跑，预判每个条目将是新建、覆盖、目录复用还是被阻挡；
+以及**磁盘暂存峰值预演**接口：在相同干跑规则下，文件额外声明非负 `size_bytes`、
+请求给出初始可用字节数，模拟“首次覆盖前同盘备份原始大小一次 → 先暂存新文件完整
+大小 → 替换并释放旧文件占用”的写盘过程，逐条给出暂存峰值与提交后新增占用、
+整批峰值及首次超出初始可用字节数的阶段（备份/暂存）与条目下标（即使超额也继续
+预演）；
 以及**前缀解包回退预演**接口：在相同干跑规则下只模拟解包清单的前
 `stop_after` 条，给出执行前需备份的现存文件与可把该前缀造成的变化完全还原的
 有序回退步骤（删新建文件、恢复被覆盖文件、由深到浅删除新建目录）；
@@ -189,6 +194,95 @@ curl -s http://localhost:8000/api/v1/overlay-preview \
   -H 'Content-Type: application/json' \
   -d '{"existing":[{"path":"docs/readme.txt","type":"file"}],"incoming":[{"path":"docs/readme.txt","type":"file"},{"path":"docs","type":"file"}]}'
 ```
+
+### `POST /api/v1/disk-peak-preview`
+
+磁盘暂存峰值预演：请求体与 overlay-preview 一样包含目标目录**现存清单**
+（`existing`）与**按顺序解包的清单**（`incoming`），但两侧的 `file` 条目都
+**必须声明非负的 `size_bytes`**（字节），`directory` 条目**不得携带**大小
+（否则返回 422）；另加非负整数 `initial_available_bytes`（解包开始前同一磁盘的
+**初始可用字节数**）。路径校验、Windows 同键（`casefold`）比较与逐条
+阻挡/覆盖判定**完全沿用 overlay-preview**（现存清单的不安全路径/同键重复/
+文件祖先冲突返回 422；incoming 不安全条目记为 BLOCKED 而非 422），
+全程纯内存计算，不访问文件系统。
+
+**仅成功写入的文件计空间**；目录（CREATE / REUSE_DIRECTORY，含隐含父目录）与
+被阻挡条目（BLOCKED）一律不占空间。每个成功文件的写盘过程按下列顺序记账：
+
+1. **备份（BACKUP）**：**首次覆盖解包前现存文件**前，在同一磁盘备份该文件的
+   **原始大小一次**（同键只备份一次）；备份在整批期间一直占用空间。
+   覆盖批次内**先新建后又覆盖**的文件不备份（回退只需删除新建文件），
+   重复覆盖也不再备份。
+2. **暂存（STAGING）**：每次写入都**先暂存新文件的完整大小**，再替换并
+   **释放被覆盖旧文件的占用**；新建文件没有旧占用可释放。
+
+设单条处理前磁盘相对初始状态的新增占用为 `S`、新文件大小为 `N`、被覆盖旧文件
+当前大小为 `O`，则：新建文件备份 0 → 暂存 `S + N` → 提交后 `S + N`
+（净增 `N`）；首次覆盖现存文件备份后 `S + O` → 暂存后 `S + O + N` →
+释放旧文件后 `S + N`（净增 `N`，备份与释放的旧占用相抵）；后续覆盖
+（重复覆盖或覆盖批次内新建文件）备份 0 → 暂存 `S + N` → 释放后
+`S + (N - O)`（净增 `N - O`，缩容时为负）。
+
+请求体示例：
+
+```json
+{
+  "existing": [
+    { "path": "docs/readme.txt", "type": "file", "size_bytes": 10 },
+    { "path": "assets", "type": "directory" }
+  ],
+  "incoming": [
+    { "path": "docs/readme.txt", "type": "file", "size_bytes": 100 },
+    { "path": "docs/readme.txt", "type": "file", "size_bytes": 40 },
+    { "path": "new/a.txt", "type": "file", "size_bytes": 50 },
+    { "path": "assets", "type": "directory" },
+    { "path": "../evil", "type": "file", "size_bytes": 999 }
+  ],
+  "initial_available_bytes": 120
+}
+```
+
+响应在 overlay-preview 的逐条字段（`status` / `blocked_reason` / `blocked_by`
+等）之外，为每条 `entries[]` 增加磁盘记账字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `size_bytes` | 文件声明大小（字节）；directory 条目为 `null` |
+| `backup_bytes` | 本条目前实际发生的备份字节：仅首次覆盖解包前现存文件时等于该现存文件大小（同键一次）；新建后再覆盖、重复覆盖、目录与被阻挡条目为 `0` |
+| `staging_peak_bytes` | 本条目造成的瞬时新增峰值（字节）：写文件时为 `backup_bytes + size_bytes`（备份与完整暂存并存的高水位）；目录与被阻挡条目为 `0` |
+| `committed_delta_bytes` | 本条目提交后留下的净新增占用（字节）：新建/首次覆盖为新文件大小，后续覆盖为新旧大小之差（缩容时为负），目录与被阻挡条目为 `0` |
+
+顶层与 `summary` 字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `initial_available_bytes` | 回显请求中的初始可用字节数 |
+| `batch_peak_bytes` | **整批峰值**：全程备份/暂存阶段磁盘相对初始状态新增占用的高水位（字节） |
+| `first_exceedance` | 新增占用**首次严格超过**初始可用字节数的阶段与条目下标：`{ index, phase, level_bytes }`，`phase` 为 `BACKUP`（备份时）或 `STAGING`（暂存时），`level_bytes` 为当时的新增占用；**等于额度不算超出**，从未超额时为 `null` |
+| `summary` | `total / create / overwrite / reuse_directory / blocked` 计数与 `committed_total_bytes`（全部提交后磁盘相对初始状态的净新增占用，等于各条目 `committed_delta_bytes` 之和） |
+
+上例的水位演进：条目 1（首次覆盖）备份 10 → 暂存 110 → 提交 100；
+条目 2（重复覆盖）暂存 **140** → 提交 40（缩容净增 -60）；条目 3（新建）
+暂存 90 → 提交 90；目录与不安全条目不影响水位。故 `batch_peak_bytes` 为 140，
+`first_exceedance` 为 `{ "index": 2, "phase": "STAGING", "level_bytes": 140 }`
+（额度 120），`committed_total_bytes` 为 90。**即使已经超额，预演也会继续
+处理完全部条目**，响应照常返回每条记账与汇总。
+
+请求校验（422）：现存清单含不安全路径、同键（Windows 比较键）重复或文件占据
+其他条目祖先路径；`file` 条目缺少 `size_bytes` 或为负数；`directory` 条目携带
+`size_bytes`；`initial_available_bytes` 为负数或缺失；`incoming` 为空，
+均返回 422。incoming 中的不安全路径条目不返回 422，而记为 BLOCKED 且不计空间。
+
+curl 示例（服务监听宿主机 **8000** 端口）：
+
+```bash
+curl -s http://localhost:8000/api/v1/disk-peak-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"existing":[{"path":"a.txt","type":"file","size_bytes":10}],"incoming":[{"path":"a.txt","type":"file","size_bytes":100}],"initial_available_bytes":120}'
+```
+
+上例备份 10 + 暂存 100 = 瞬时峰值 110，未超过额度 120（`first_exceedance` 为
+`null`），提交后净增 100。
 
 ### `POST /api/v1/rollback-preview`
 
@@ -812,15 +906,16 @@ curl -s http://localhost:8000/api/v1/preflight \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/rollback-preview、/api/v1/mirror-preview、/api/v1/manifest-audit、/api/v1/relocation-preview）
+│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/disk-peak-preview、/api/v1/rollback-preview、/api/v1/mirror-preview、/api/v1/manifest-audit、/api/v1/relocation-preview）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、rollback-preview、mirror-preview、manifest-audit、relocation-preview）
-│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、前缀回退预演、镜像同步预演、清单核对与重定位预演编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、disk-peak-preview、rollback-preview、mirror-preview、manifest-audit、relocation-preview）
+│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、磁盘峰值预演、前缀回退预演、镜像同步预演、清单核对与重定位预演编排
 │   ├── audit.py         # 清单核对：缺失/额外/类型不符/摘要不符/一致、层级阻挡与同键歧义（纯函数）
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   ├── resource.py      # 解压资源预算校验：单文件/整批解压大小、整数交叉乘法压缩比（纯函数）
 │   ├── selection.py     # selection_rules glob 匹配（*、? 按段，** 跨多级）与 include/exclude 筛选（纯函数）
 │   ├── overlay.py       # 目标目录覆盖预演：清单校验、虚拟目录树与按序干跑（纯函数）
+│   ├── disk_peak.py     # 磁盘暂存峰值预演：首次覆盖备份 + 先暂存后替换释放的占用记账、整批峰值与首次超额（纯函数）
 │   ├── rollback.py      # 前缀解包回退预演：执行前备份清单与删文件/恢复/深→浅删目录三阶段回退步骤（纯函数）
 │   ├── mirror.py        # 目录镜像同步预演：三阶段操作序列（删除→建目录→写文件，纯函数）
 │   ├── relocation.py    # 路径重定位预演：源前缀→目标前缀改写与结果冲突检测（纯函数）

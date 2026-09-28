@@ -8,6 +8,7 @@ from enum import Enum
 from pydantic import BaseModel, Field, model_validator
 
 from .normalize import IssueCode, IssueSeverity, normalize_entry
+from .disk_peak import DiskPeakPhase
 from .mirror import MirrorOperation
 from .audit import AuditStatus, ManifestSide
 from .relocation import RelocationConflictType
@@ -480,6 +481,135 @@ class OverlayPreviewResponse(BaseModel):
     target: str = "windows"
     entries: list[OverlayEntryOut]
     summary: OverlaySummary
+
+
+class DiskPeakEntryIn(BaseModel):
+    path: str = Field(..., description="目标目录内的相对路径（原始形式）")
+    type: OverlayEntryType = Field(..., description="条目类型：file 或 directory")
+    size_bytes: int | None = Field(
+        default=None,
+        ge=0,
+        description="文件声明大小（字节，非负）；type 为 file 时必填，directory 不得携带",
+    )
+
+    @model_validator(mode="after")
+    def _validate_size(self) -> "DiskPeakEntryIn":
+        if self.type is OverlayEntryType.FILE:
+            if self.size_bytes is None:
+                raise ValueError("type 为 file 时必须提供非负 size_bytes")
+        elif self.size_bytes is not None:
+            raise ValueError("仅 file 条目可携带 size_bytes")
+        return self
+
+
+class DiskPeakPreviewRequest(BaseModel):
+    """磁盘暂存峰值预演请求：现存清单（含大小）+ 按序解包清单（含大小）+ 初始可用字节。"""
+
+    existing: list[DiskPeakEntryIn] = Field(
+        default_factory=list,
+        description=(
+            "目标目录现存的 file/directory 清单（可为空，表示空目录）；文件必须声明"
+            "非负 size_bytes，目录不带大小；沿用 overlay-preview 的现存清单校验，"
+            "含不安全路径、同键重复或文件占据其他条目祖先路径时返回 422"
+        ),
+    )
+    incoming: list[DiskPeakEntryIn] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "按顺序解包的 file/directory 清单（至少 1 条）；文件必须声明非负 "
+            "size_bytes，目录不带大小；不安全条目不返回 422 而在干跑中记为 BLOCKED"
+        ),
+    )
+    initial_available_bytes: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "解包开始前同一磁盘的可用字节数（非负）；备份或暂存阶段的磁盘新增占用"
+            "严格大于该值（等于不算超出）即记为超额，但预演继续"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_existing_list(self) -> "DiskPeakPreviewRequest":
+        normalized = [
+            normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+            for i, e in enumerate(self.existing, start=1)
+        ]
+        validate_existing_entries(normalized)
+        return self
+
+
+class DiskPeakEntryOut(OverlayEntryOut):
+    size_bytes: int | None = Field(
+        ..., description="文件声明大小（字节）；directory 条目为 null"
+    )
+    backup_bytes: int = Field(
+        ...,
+        description=(
+            "本条目前实际发生的备份字节：仅首次覆盖解包前现存文件时等于该现存文件"
+            "大小（同键只备份一次）；新建后再覆盖、重复覆盖、目录与被阻挡条目为 0"
+        ),
+    )
+    staging_peak_bytes: int = Field(
+        ...,
+        description=(
+            "本条目造成的瞬时新增峰值（字节）：写文件时为备份字节 + 新文件完整"
+            "暂存大小；目录与被阻挡条目为 0"
+        ),
+    )
+    committed_delta_bytes: int = Field(
+        ...,
+        description=(
+            "本条目提交后留下的净新增占用（字节）：新建/首次覆盖为新文件大小，"
+            "后续覆盖为新旧大小之差（缩容时为负），目录与被阻挡条目为 0"
+        ),
+    )
+
+
+class DiskPeakExceedanceOut(BaseModel):
+    index: int = Field(
+        ..., description="首次超额时正在处理的 incoming 条目下标（从 1 开始）"
+    )
+    phase: DiskPeakPhase = Field(
+        ..., description="首次超额发生的阶段：BACKUP（备份）或 STAGING（暂存）"
+    )
+    level_bytes: int = Field(
+        ..., description="超额发生时磁盘相对初始状态的新增占用字节（严格大于初始可用字节数）"
+    )
+
+
+class DiskPeakSummary(BaseModel):
+    total: int
+    create: int
+    overwrite: int
+    reuse_directory: int
+    blocked: int
+    committed_total_bytes: int = Field(
+        ...,
+        description=(
+            "全部条目提交后磁盘相对初始状态的净新增占用字节（各条目 "
+            "committed_delta_bytes 之和；备份在整批期间一直占用空间）"
+        ),
+    )
+
+
+class DiskPeakPreviewResponse(BaseModel):
+    target: str = "windows"
+    initial_available_bytes: int = Field(..., description="回显请求中的初始可用字节数")
+    entries: list[DiskPeakEntryOut]
+    batch_peak_bytes: int = Field(
+        ...,
+        description="全程备份/暂存阶段磁盘新增占用的高水位（整批峰值，字节）",
+    )
+    first_exceedance: DiskPeakExceedanceOut | None = Field(
+        ...,
+        description=(
+            "磁盘新增占用首次严格超过初始可用字节数的阶段与条目下标；"
+            "等于额度不算超出，从未超额时为 null"
+        ),
+    )
+    summary: DiskPeakSummary
 
 
 class RollbackPreviewRequest(BaseModel):
